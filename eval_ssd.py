@@ -15,11 +15,19 @@ import sys
 from vision.ssd.mobilenet_v2_ssd_lite import create_mobilenetv2_ssd_lite, create_mobilenetv2_ssd_lite_predictor
 from vision.ssd.mobilenetv3_ssd_lite import create_mobilenetv3_large_ssd_lite, create_mobilenetv3_small_ssd_lite
 
+import pymlir
+import caffe
+import pyruntime
+
 
 parser = argparse.ArgumentParser(description="SSD Evaluation on VOC Dataset.")
 parser.add_argument('--net', default="vgg16-ssd",
                     help="The network architecture, it should be of mb1-ssd, mb1-ssd-lite, mb2-ssd-lite or vgg16-ssd.")
 parser.add_argument("--trained_model", type=str)
+parser.add_argument("--net_file", type=str)
+parser.add_argument("--is_mlir", type=str2bool, default=False)
+parser.add_argument("--is_caffe", type=str2bool, default=False)
+parser.add_argument("--is_cvimodel", type=str2bool, default=False)
 
 parser.add_argument("--dataset_type", default="voc", type=str,
                     help='Specify dataset type. Currently support voc and open_images.')
@@ -112,12 +120,33 @@ def compute_average_precision_per_class(num_true_cases, gt_boxes, difficult_case
 
     true_positive = true_positive.cumsum()
     false_positive = false_positive.cumsum()
-    precision = true_positive / (true_positive + false_positive)
+    tf = true_positive + false_positive
+    precision = np.zeros(tf.shape)  #preinit
+    np.divide(true_positive, tf, out=precision, where=tf!=0) #only divide nonzeros else 1
+    #precision = true_positive / (true_positive + false_positive)
     recall = true_positive / num_true_cases
     if use_2007_metric:
         return measurements.compute_voc2007_average_precision(precision, recall)
     else:
         return measurements.compute_average_precision(precision, recall)
+
+def quant(x, scale):
+  x = x * scale
+  x = np.trunc(x + np.copysign(.5, x))
+  x[x > 127.0] = 127.0
+  x[x < -128.0] = -128.0
+  return x.astype(np.int8)
+
+def postprocess(img, out, prob_threshold=0.01):
+    h = img.shape[0]
+    w = img.shape[1]
+    box = out['detection_out'][0,0,:,3:7] * np.array([w, h, w, h])
+
+    cls = out['detection_out'][0,0,:,1]
+    conf = out['detection_out'][0,0,:,2]
+
+    return (box.astype(np.int32), conf, cls)
+
 
 
 if __name__ == '__main__':
@@ -151,34 +180,92 @@ if __name__ == '__main__':
         parser.print_help(sys.stderr)
         sys.exit(1)
 
-    timer.start("Load Model")
-    net.load(args.trained_model)
-    net = net.to(DEVICE)
-    print(f'It took {timer.end("Load Model")} seconds to load the model.')
-    if args.net == 'vgg16-ssd':
-        predictor = create_vgg_ssd_predictor(net, nms_method=args.nms_method, device=DEVICE)
-    elif args.net == 'mb1-ssd':
-        predictor = create_mobilenetv1_ssd_predictor(net, nms_method=args.nms_method, device=DEVICE)
-    elif args.net == 'mb1-ssd-lite':
-        predictor = create_mobilenetv1_ssd_lite_predictor(net, nms_method=args.nms_method, device=DEVICE)
-    elif args.net == 'sq-ssd-lite':
-        predictor = create_squeezenet_ssd_lite_predictor(net,nms_method=args.nms_method, device=DEVICE)
-    elif args.net == 'mb2-ssd-lite' or args.net == "mb3-large-ssd-lite" or args.net == "mb3-small-ssd-lite":
-        predictor = create_mobilenetv2_ssd_lite_predictor(net, nms_method=args.nms_method, device=DEVICE)
+    if args.is_mlir:
+        net = pymlir.module()
+        print('mlir load module ', args.trained_model)
+        net.load(args.trained_model)
+        print('load module done')
+    if args.is_cvimodel:
+        batch_size = 1
+        print('cvimodel load module ', args.trained_model)
+        net = pyruntime.Model(args.trained_model, batch_size, output_all_tensors=False)
+    elif args.is_caffe:
+        print('caffe load module ', args.trained_model, "proto", args.net_file)
+        net = caffe.Net(args.net_file, args.trained_model, caffe.TEST)
     else:
-        logging.fatal("The net type is wrong. It should be one of vgg16-ssd, mb1-ssd and mb1-ssd-lite.")
-        parser.print_help(sys.stderr)
-        sys.exit(1)
+        timer.start("Load Model")
+        net.load(args.trained_model)
+        net = net.to(DEVICE)
+        print(f'It took {timer.end("Load Model")} seconds to load the model.')
+
+        if args.net == 'vgg16-ssd':
+            predictor = create_vgg_ssd_predictor(net, nms_method=args.nms_method, device=DEVICE)
+        elif args.net == 'mb1-ssd':
+            predictor = create_mobilenetv1_ssd_predictor(net, nms_method=args.nms_method, device=DEVICE)
+        elif args.net == 'mb1-ssd-lite':
+            predictor = create_mobilenetv1_ssd_lite_predictor(net, nms_method=args.nms_method, device=DEVICE)
+        elif args.net == 'sq-ssd-lite':
+            predictor = create_squeezenet_ssd_lite_predictor(net,nms_method=args.nms_method, device=DEVICE)
+        elif args.net == 'mb2-ssd-lite' or args.net == "mb3-large-ssd-lite" or args.net == "mb3-small-ssd-lite":
+            predictor = create_mobilenetv2_ssd_lite_predictor(net, nms_method=args.nms_method, device=DEVICE)
+        else:
+            logging.fatal("The net type is wrong. It should be one of vgg16-ssd, mb1-ssd and mb1-ssd-lite.")
+            parser.print_help(sys.stderr)
+            sys.exit(1)
 
     results = []
+    print(len(dataset), "images")
+
+
+
     for i in range(len(dataset)):
-        print("process image", i)
-        timer.start("Load Image")
-        image = dataset.get_image(i)
-        print("Load Image: {:4f} seconds.".format(timer.end("Load Image")))
-        timer.start("Predict")
-        boxes, labels, probs = predictor.predict(image)
-        print("Prediction: {:4f} seconds.".format(timer.end("Predict")))
+        if args.is_mlir:
+            image, orgimage = dataset.get_image(i, False)
+
+            res = net.run(image)
+            out = net.get_all_tensor()
+            box, conf, cls = postprocess(orgimage, out)
+            labels = torch.from_numpy(cls)
+            probs = torch.from_numpy(conf)
+            boxes = torch.from_numpy(box)
+        elif args.is_cvimodel:
+            image, orgimage = dataset.get_image(i, False)
+
+            # fill data to inputs
+            data = net.inputs[0].data
+            qscale = net.inputs[0].qscale
+            # load input data and quant to int8
+            input = quant(image, qscale)
+            # fill input data to input tensor of model
+            data[:] = input.reshape(data.shape)
+            # forward
+            net.forward()
+
+            out = {"detection_out": net.outputs[0].data}
+            box, conf, cls = postprocess(orgimage, out)
+            labels = torch.from_numpy(cls)
+            probs = torch.from_numpy(conf)
+            boxes = torch.from_numpy(box)
+
+        elif args.is_caffe:
+            image, orgimage = dataset.get_image(i, False)
+            net.blobs['data'].data[...] = image
+            out = net.forward()
+            box, conf, cls = postprocess(orgimage, out)
+            labels = torch.from_numpy(cls)
+            probs = torch.from_numpy(conf)
+            boxes = torch.from_numpy(box)
+        else:
+            print("process image", i)
+            timer.start("Load Image")
+            image = dataset.get_image(i)
+            print("Load Image: {:4f} seconds.".format(timer.end("Load Image")))
+            timer.start("Predict")
+            image = dataset.get_image(i)
+            boxes, labels, probs = predictor.predict(image)
+            print("Prediction: {:4f} seconds.".format(timer.end("Predict")))
+
+
         indexes = torch.ones(labels.size(0), 1, dtype=torch.float32) * i
         results.append(torch.cat([
             indexes.reshape(-1, 1),
